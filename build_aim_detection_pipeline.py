@@ -1,728 +1,749 @@
-"""Aim detection pipeline for elimination review.
+"""Gameplay elimination detection and aim heuristics pipeline.
 
-This module implements an end-to-end pipeline that ingests a gameplay video,
-identifies elimination events, extracts clips, computes aim related features, and
-produces CSV/HTML reports with suspicion scores.
+This script scans a gameplay video, detects potential elimination moments using
+simple visual heuristics, extracts highlight clips, computes lightweight aim
+metrics, and produces CSV/HTML reports ranking suspicious eliminations.
 
-The implementation focuses on providing a modular, extendable architecture that
-can integrate computer vision, audio, and OCR detectors while remaining usable
-on systems where those dependencies are unavailable. When specialised models or
-pre-computed detections are missing, the pipeline gracefully falls back to
-placeholder heuristics so that the full reporting stack continues to operate.
+It intentionally avoids heavyweight ML dependencies so that it can operate on a
+vanilla Python + OpenCV stack while still yielding useful, inspectable output.
+The heuristics are basic but provide a concrete baseline that can be extended
+with richer detectors in future iterations.
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
-import json
 import logging
+import math
 import statistics
 import subprocess
-import sys
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover - numpy is optional at runtime
-    np = None  # type: ignore
-
-try:
-    import pandas as pd
-except ImportError:  # pragma: no cover - pandas is optional at runtime
-    pd = None  # type: ignore
+import cv2
+import numpy as np
 
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the aim detection pipeline."""
+    """Runtime configuration for the pipeline."""
 
     video_path: Path
     output_dir: Path
-    gpu_device: Optional[int] = None
     pre_window: float = 10.0
     post_window: float = 2.0
-    frame_sample_rate: int = 1
-    suspicion_threshold: float = 0.8
+    frame_stride: int = 1
+    min_event_gap: float = 1.5
+    detection_std_factor: float = 2.5
     min_reaction_ms: float = 40.0
-    chunk_duration: Optional[float] = None
-    preprocessed_dir: Optional[Path] = None
+    center_ratio: float = 0.18
     debug: bool = False
 
 
 @dataclass
 class VideoMetadata:
-    """Stores key metadata about the video."""
+    """Lightweight container describing the input video."""
 
     fps: float
     width: int
     height: int
+    frame_count: int
     duration: float
 
 
 @dataclass
-class DetectionSignal:
-    """A raw signal from any elimination detector."""
+class FrameScore:
+    """Score captured for a processed frame."""
 
     timestamp: float
-    confidence: float
-    detector: str
-    data: Dict[str, Any] = field(default_factory=dict)
+    combined_score: float
+    global_score: float
+    center_score: float
+    color_score: float
+    center_brightness: float
 
 
 @dataclass
 class EliminationEvent:
-    """Represents a fused elimination event."""
+    """Represents a detected elimination."""
 
     elim_id: str
     timestamp: float
-    confidence: float
-    signals: List[DetectionSignal]
+    score: float
+    source: FrameScore
 
 
 @dataclass
 class EliminationFeatures:
-    """Feature vector computed around an elimination event."""
+    """Aim heuristics computed for an elimination."""
 
     elim_id: str
     timestamp: float
-    clip_file: Optional[str] = None
-    reaction_ms: Optional[float] = None
-    dwell_ms: Optional[float] = None
-    micro_adjusts_per_s: Optional[float] = None
-    snap_magnitude_px: Optional[float] = None
-    snap_frames: Optional[int] = None
-    headshot: Optional[bool] = None
-    shots_count: Optional[int] = None
-    headshot_ratio: Optional[float] = None
-    aim_variance: Optional[float] = None
-    muzzle_flash_count: Optional[int] = None
-    suspicion_score: Optional[float] = None
-    flags: List[str] = field(default_factory=list)
+    clip_file: Optional[str]
+    reaction_ms: Optional[float]
+    dwell_ms: Optional[float]
+    micro_adjusts_per_s: Optional[float]
+    snap_magnitude_px: Optional[float]
+    snap_frames: Optional[int]
+    headshot: Optional[bool]
+    shots_count: Optional[int]
+    headshot_ratio: Optional[float]
+    aim_variance: Optional[float]
+    muzzle_flash_count: Optional[int]
+    suspicion_score: float
+    flags: List[str]
 
 
-class FFprobe:
-    """Utility wrapper around ffprobe for querying video metadata."""
+# ---------------------------------------------------------------------------
+# Metadata helpers
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def probe(video_path: Path) -> VideoMetadata:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=avg_frame_rate,width,height",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(video_path),
-        ]
-        logging.debug("Running ffprobe: %s", " ".join(cmd))
-        try:
-            result = subprocess.run(
-                cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+def _ensure_positive(value: float, fallback: float) -> float:
+    return value if value and value > 0 else fallback
+
+
+def load_video_metadata(video_path: Path) -> VideoMetadata:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open video: {video_path}")
+
+    fps = _ensure_positive(cap.get(cv2.CAP_PROP_FPS), 30.0)
+    width = int(_ensure_positive(cap.get(cv2.CAP_PROP_FRAME_WIDTH), 0))
+    height = int(_ensure_positive(cap.get(cv2.CAP_PROP_FRAME_HEIGHT), 0))
+    frame_count_val = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = 0.0
+    if frame_count_val > 0:
+        duration = frame_count_val / fps
+    cap.release()
+
+    return VideoMetadata(
+        fps=fps,
+        width=width,
+        height=height,
+        frame_count=frame_count_val,
+        duration=duration,
+    )
+
+
+def _center_slice(height: int, width: int, ratio: float) -> tuple[int, int, int, int]:
+    half = int(min(height, width) * max(min(ratio, 0.8), 0.02) * 0.5)
+    half = max(4, half)
+    cy = height // 2
+    cx = width // 2
+    y0 = max(0, cy - half)
+    y1 = min(height, cy + half)
+    x0 = max(0, cx - half)
+    x1 = min(width, cx + half)
+    return y0, y1, x0, x1
+
+
+# ---------------------------------------------------------------------------
+# Detection pass
+# ---------------------------------------------------------------------------
+
+def collect_frame_scores(
+    video_path: Path, metadata: VideoMetadata, config: PipelineConfig
+) -> tuple[List[FrameScore], VideoMetadata]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open video: {video_path}")
+
+    fps = metadata.fps
+    prev_gray: Optional[np.ndarray] = None
+    scores: List[FrameScore] = []
+    frame_idx = 0
+    processed_frames = 0
+
+    width = metadata.width
+    height = metadata.height
+
+    y0 = y1 = x0 = x1 = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+        if width == 0 or height == 0:
+            height, width = frame.shape[:2]
+            y0, y1, x0, x1 = _center_slice(height, width, config.center_ratio)
+        elif processed_frames == 0:
+            y0, y1, x0, x1 = _center_slice(height, width, config.center_ratio)
+
+        if frame_idx % max(config.frame_stride, 1) != 0:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is None:
+            prev_gray = gray
+            processed_frames += 1
+            continue
+
+        diff = cv2.absdiff(gray, prev_gray)
+        center_diff = diff[y0:y1, x0:x1]
+        global_score = float(np.mean(diff))
+        center_score = float(np.mean(center_diff))
+
+        red_channel = frame[:, :, 2]
+        red_center = red_channel[y0:y1, x0:x1]
+        bright_red = float(np.mean(red_center > 200)) * 255.0
+
+        center_patch = gray[y0:y1, x0:x1]
+        center_brightness = float(np.mean(center_patch))
+
+        combined = global_score * 0.5 + center_score * 0.35 + bright_red * 0.15
+        timestamp = (frame_idx - 1) / fps
+
+        scores.append(
+            FrameScore(
+                timestamp=timestamp,
+                combined_score=combined,
+                global_score=global_score,
+                center_score=center_score,
+                color_score=bright_red,
+                center_brightness=center_brightness,
             )
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # pragma: no cover - tool failure
-            raise RuntimeError("ffprobe is required to read video metadata") from exc
-
-        data = json.loads(result.stdout)
-        stream = data.get("streams", [{}])[0]
-        fmt = data.get("format", {})
-
-        avg_frame_rate = stream.get("avg_frame_rate", "0/1")
-        if avg_frame_rate and "/" in avg_frame_rate:
-            num, den = avg_frame_rate.split("/")
-            fps = float(num) / max(float(den), 1.0)
-        else:
-            fps = float(avg_frame_rate)
-
-        duration = float(fmt.get("duration", 0.0))
-        width = int(stream.get("width", 0))
-        height = int(stream.get("height", 0))
-        metadata = VideoMetadata(fps=fps, width=width, height=height, duration=duration)
-        logging.debug("Parsed video metadata: %s", metadata)
-        return metadata
-
-
-class BaseDetector:
-    """Interface for elimination detection modules."""
-
-    name: str = "base"
-
-    def detect(
-        self, config: PipelineConfig, metadata: VideoMetadata
-    ) -> List[DetectionSignal]:  # pragma: no cover - base class method
-        raise NotImplementedError
-
-
-class PreprocessedDetector(BaseDetector):
-    """Loads elimination candidates from preprocessed JSON/CSV files."""
-
-    name = "preprocessed"
-
-    def detect(self, config: PipelineConfig, metadata: VideoMetadata) -> List[DetectionSignal]:
-        if not config.preprocessed_dir:
-            return []
-
-        directory = config.preprocessed_dir
-        signals: List[DetectionSignal] = []
-
-        json_path = directory / "eliminations.json"
-        csv_path = directory / "eliminations.csv"
-
-        if json_path.exists():
-            logging.info("Loading elimination timestamps from %s", json_path)
-            with json_path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-            for entry in payload:
-                timestamp = float(entry.get("timestamp", 0.0))
-                confidence = float(entry.get("confidence", 0.5))
-                signals.append(
-                    DetectionSignal(timestamp=timestamp, confidence=confidence, detector=self.name, data=entry)
-                )
-        elif csv_path.exists():
-            logging.info("Loading elimination timestamps from %s", csv_path)
-            with csv_path.open("r", encoding="utf-8") as fh:
-                for idx, line in enumerate(fh):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    try:
-                        timestamp = float(line.split(",")[0])
-                    except ValueError:
-                        logging.debug("Skipping malformed line %d in %s", idx, csv_path)
-                        continue
-                    signals.append(
-                        DetectionSignal(
-                            timestamp=timestamp,
-                            confidence=0.5,
-                            detector=self.name,
-                            data={"source": "csv"},
-                        )
-                    )
-        else:
-            logging.debug("No preprocessed elimination files located in %s", directory)
-        return signals
-
-
-class HeuristicKillFeedDetector(BaseDetector):
-    """Placeholder detector using rough heuristics on optional OCR dumps."""
-
-    name = "kill_feed"
-
-    def detect(self, config: PipelineConfig, metadata: VideoMetadata) -> List[DetectionSignal]:
-        if not config.preprocessed_dir:
-            logging.debug("Kill feed detector skipped (no preprocessed dir).")
-            return []
-        kill_feed_file = config.preprocessed_dir / "kill_feed.json"
-        if not kill_feed_file.exists():
-            logging.debug("Kill feed detector skipped (missing %s).", kill_feed_file)
-            return []
-
-        with kill_feed_file.open("r", encoding="utf-8") as fh:
-            entries = json.load(fh)
-        signals: List[DetectionSignal] = []
-        for entry in entries:
-            phrase = entry.get("text", "").lower()
-            if any(keyword in phrase for keyword in ["eliminated", "you eliminated", "knocked"]):
-                timestamp = float(entry.get("timestamp", 0.0))
-                confidence = float(entry.get("confidence", 0.7))
-                signals.append(
-                    DetectionSignal(
-                        timestamp=timestamp,
-                        confidence=confidence,
-                        detector=self.name,
-                        data=entry,
-                    )
-                )
-        return signals
-
-
-class HeuristicAudioDetector(BaseDetector):
-    """Audio based heuristic using precomputed spectral peaks when available."""
-
-    name = "audio"
-
-    def detect(self, config: PipelineConfig, metadata: VideoMetadata) -> List[DetectionSignal]:
-        if not config.preprocessed_dir:
-            logging.debug("Audio detector skipped (no preprocessed dir).")
-            return []
-        peaks_file = config.preprocessed_dir / "audio_peaks.json"
-        if not peaks_file.exists():
-            logging.debug("Audio detector skipped (missing %s).", peaks_file)
-            return []
-
-        with peaks_file.open("r", encoding="utf-8") as fh:
-            entries = json.load(fh)
-        signals: List[DetectionSignal] = []
-        for entry in entries:
-            if entry.get("label") != "elimination":
-                continue
-            timestamp = float(entry.get("timestamp", 0.0))
-            confidence = float(entry.get("confidence", 0.6))
-            signals.append(
-                DetectionSignal(
-                    timestamp=timestamp,
-                    confidence=confidence,
-                    detector=self.name,
-                    data=entry,
-                )
-            )
-        return signals
-
-
-class DetectionFusion:
-    """Fuse detection signals into consolidated elimination events."""
-
-    def __init__(self, tolerance: float = 0.75):
-        self.tolerance = tolerance
-
-    def fuse(self, signals: Sequence[DetectionSignal]) -> List[EliminationEvent]:
-        if not signals:
-            return []
-        sorted_signals = sorted(signals, key=lambda s: s.timestamp)
-        events: List[EliminationEvent] = []
-        current_group: List[DetectionSignal] = []
-        group_start: Optional[float] = None
-
-        for signal in sorted_signals:
-            if group_start is None:
-                group_start = signal.timestamp
-            if signal.timestamp - group_start <= self.tolerance:
-                current_group.append(signal)
-            else:
-                events.extend(self._finalise_group(current_group))
-                current_group = [signal]
-                group_start = signal.timestamp
-        if current_group:
-            events.extend(self._finalise_group(current_group))
-        return events
-
-    def _finalise_group(self, group: List[DetectionSignal]) -> List[EliminationEvent]:
-        if not group:
-            return []
-        timestamp = sum(signal.timestamp for signal in group) / len(group)
-        confidence = max(signal.confidence for signal in group)
-        elim_id = f"{len(group):04d}-{abs(hash(timestamp)) % 1_000_000:06d}"
-        event = EliminationEvent(elim_id=elim_id, timestamp=timestamp, confidence=confidence, signals=list(group))
-        logging.debug("Fused event %s with %d signals", event.elim_id, len(group))
-        return [event]
-
-
-class ClipExtractor:
-    """Handles extraction of short video clips around elimination times."""
-
-    def __init__(self, config: PipelineConfig, metadata: VideoMetadata):
-        self.config = config
-        self.metadata = metadata
-
-    def extract_clip(self, event: EliminationEvent, clips_dir: Path) -> Optional[Path]:
-        start = max(event.timestamp - self.config.pre_window, 0.0)
-        duration = self.config.pre_window + self.config.post_window
-        clips_dir.mkdir(parents=True, exist_ok=True)
-        out_path = clips_dir / f"{event.elim_id}.mp4"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{start:.3f}",
-            "-i",
-            str(self.config.video_path),
-            "-t",
-            f"{duration:.3f}",
-            "-c",
-            "copy",
-            str(out_path),
-        ]
-        if self.config.gpu_device is not None:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-hwaccel",
-                "cuda",
-                "-hwaccel_device",
-                str(self.config.gpu_device),
-                "-ss",
-                f"{start:.3f}",
-                "-i",
-                str(self.config.video_path),
-                "-t",
-                f"{duration:.3f}",
-                "-c",
-                "copy",
-                str(out_path),
-            ]
-        logging.debug("Extracting clip with command: %s", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # pragma: no cover - ffmpeg failure
-            logging.warning("Failed to extract clip for %s: %s", event.elim_id, exc)
-            return None
-        return out_path
-
-
-class PreprocessedFeatureLoader:
-    """Loads precomputed features when present."""
-
-    def __init__(self, directory: Path):
-        self.directory = directory
-        self.index: Dict[str, Dict[str, Any]] = {}
-        if directory.exists():
-            cache_file = directory / "aim_features.json"
-            if cache_file.exists():
-                try:
-                    with cache_file.open("r", encoding="utf-8") as fh:
-                        payload = json.load(fh)
-                    for entry in payload:
-                        elim_id = str(entry.get("elim_id"))
-                        if elim_id:
-                            self.index[elim_id] = entry
-                except json.JSONDecodeError:
-                    logging.warning("Failed to parse %s", cache_file)
-
-    def get(self, elim_id: str) -> Optional[Dict[str, Any]]:
-        return self.index.get(elim_id)
-
-
-class AimFeatureExtractor:
-    """Computes aim-related features for an elimination event."""
-
-    def __init__(self, config: PipelineConfig, metadata: VideoMetadata):
-        self.config = config
-        self.metadata = metadata
-        self.preprocessed_loader = (
-            PreprocessedFeatureLoader(config.preprocessed_dir) if config.preprocessed_dir else None
         )
 
-    def extract(self, event: EliminationEvent) -> EliminationFeatures:
-        features = EliminationFeatures(elim_id=event.elim_id, timestamp=event.timestamp)
-        if self.preprocessed_loader:
-            cached = self.preprocessed_loader.get(event.elim_id)
-            if cached:
-                logging.debug("Using preprocessed features for %s", event.elim_id)
-                self._populate_from_mapping(features, cached)
-                return features
+        prev_gray = gray
+        processed_frames += 1
 
-        reaction_ms, dwell_ms = self._estimate_timing_from_signals(event.signals)
-        snap_magnitude_px = self._estimate_snap_from_signals(event.signals)
-        micro_adjusts = self._estimate_micro_adjusts(event.signals)
+    cap.release()
 
-        features.reaction_ms = reaction_ms
-        features.dwell_ms = dwell_ms
-        features.micro_adjusts_per_s = micro_adjusts
-        features.snap_magnitude_px = snap_magnitude_px
-        features.snap_frames = None
-        features.headshot = self._infer_headshot(event.signals)
-        features.shots_count = self._infer_shots(event.signals)
-        features.headshot_ratio = None
-        features.aim_variance = None
-        features.muzzle_flash_count = None
-        return features
+    duration = metadata.duration
+    if processed_frames > 0:
+        last_timestamp = (frame_idx - 1) / fps
+        duration = max(duration, last_timestamp)
 
-    def _populate_from_mapping(self, features: EliminationFeatures, mapping: Dict[str, Any]) -> None:
-        for key, value in mapping.items():
-            if hasattr(features, key):
-                setattr(features, key, value)
-
-    def _estimate_timing_from_signals(self, signals: Sequence[DetectionSignal]) -> Tuple[Optional[float], Optional[float]]:
-        timestamps = [signal.timestamp for signal in signals if signal.detector == "audio"]
-        if not timestamps:
-            return None, None
-        spread = max(timestamps) - min(timestamps)
-        reaction_ms = max(0.0, 1000.0 * (spread / max(len(timestamps), 1)))
-        dwell_ms = 1000.0 * spread
-        return reaction_ms, dwell_ms
-
-    def _estimate_snap_from_signals(self, signals: Sequence[DetectionSignal]) -> Optional[float]:
-        if np is None:
-            return None
-        magnitudes = [signal.data.get("snap_magnitude", 0.0) for signal in signals if "snap_magnitude" in signal.data]
-        if not magnitudes:
-            return None
-        return float(np.mean(magnitudes))
-
-    def _estimate_micro_adjusts(self, signals: Sequence[DetectionSignal]) -> Optional[float]:
-        counts = [signal.data.get("micro_adjusts", 0) for signal in signals if "micro_adjusts" in signal.data]
-        if not counts:
-            return None
-        duration = max(self.config.pre_window, 1.0)
-        return sum(counts) / duration
-
-    def _infer_headshot(self, signals: Sequence[DetectionSignal]) -> Optional[bool]:
-        for signal in signals:
-            if "headshot" in signal.data:
-                return bool(signal.data.get("headshot"))
-        return None
-
-    def _infer_shots(self, signals: Sequence[DetectionSignal]) -> Optional[int]:
-        shot_counts = [signal.data.get("shots", 1) for signal in signals if "shots" in signal.data]
-        if not shot_counts:
-            return None
-        return int(max(shot_counts))
+    updated_metadata = VideoMetadata(
+        fps=metadata.fps,
+        width=width,
+        height=height,
+        frame_count=frame_idx,
+        duration=duration,
+    )
+    logging.debug("Collected %d frame scores", len(scores))
+    return scores, updated_metadata
 
 
-class SuspicionScorer:
-    """Combine features into a suspicion score and flags."""
+def detect_eliminations(
+    scores: Sequence[FrameScore], config: PipelineConfig
+) -> List[EliminationEvent]:
+    if not scores:
+        return []
 
-    def __init__(self, config: PipelineConfig):
-        self.config = config
+    values = np.array([s.combined_score for s in scores], dtype=float)
+    baseline = float(np.mean(values)) if values.size else 0.0
+    stdev = float(np.std(values)) if values.size else 0.0
+    threshold = baseline + config.detection_std_factor * stdev
+    if not math.isfinite(threshold) or threshold <= baseline:
+        threshold = baseline + max(5.0, baseline * 0.5)
 
-    def score(self, features: Iterable[EliminationFeatures]) -> List[EliminationFeatures]:
-        scored: List[EliminationFeatures] = []
-        reaction_values: List[float] = []
-        for feat in features:
-            if feat.reaction_ms is not None:
-                reaction_values.append(feat.reaction_ms)
+    candidates = [s for s in scores if s.combined_score >= threshold]
+    candidates.sort(key=lambda s: s.timestamp)
 
-        reaction_std = statistics.pstdev(reaction_values) if len(reaction_values) > 1 else None
-        for feat in features:
-            score, flags = self._score_single(feat, reaction_std)
-            feat.suspicion_score = score
-            feat.flags = flags
-            scored.append(feat)
-        return scored
+    merged: List[FrameScore] = []
+    for cand in candidates:
+        if not merged:
+            merged.append(cand)
+            continue
+        if cand.timestamp - merged[-1].timestamp < config.min_event_gap:
+            if cand.combined_score > merged[-1].combined_score:
+                merged[-1] = cand
+            continue
+        merged.append(cand)
 
-    def _score_single(
-        self, feat: EliminationFeatures, global_reaction_std: Optional[float]
-    ) -> Tuple[float, List[str]]:
-        score = 0.0
-        flags: List[str] = []
+    events = [
+        EliminationEvent(
+            elim_id=f"{idx + 1:04d}",
+            timestamp=score.timestamp,
+            score=score.combined_score,
+            source=score,
+        )
+        for idx, score in enumerate(merged)
+    ]
 
-        if feat.reaction_ms is not None:
-            if feat.reaction_ms < self.config.min_reaction_ms:
-                score += 0.4
-                flags.append("fast_reaction")
-            score += max(0.0, (self.config.min_reaction_ms - feat.reaction_ms) / 100.0)
-
-        if feat.snap_magnitude_px is not None:
-            normalized_snap = min(feat.snap_magnitude_px / 300.0, 1.0)
-            if normalized_snap > 0.5:
-                score += 0.3 * normalized_snap
-                flags.append("large_snap")
-
-        if feat.micro_adjusts_per_s is not None and feat.micro_adjusts_per_s < 1.0:
-            score += 0.1
-            flags.append("low_micro_adjusts")
-
-        if global_reaction_std is not None and global_reaction_std < 20:
-            score += 0.2
-            flags.append("low_reaction_variance")
-
-        if feat.headshot:
-            score += 0.05
-            flags.append("headshot")
-
-        score = min(score, 1.0)
-        return score, flags
+    logging.info("Detected %d elimination candidates", len(events))
+    return events
 
 
-class ReportWriter:
-    """Generates CSV/HTML reports from scored features."""
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
 
-    def __init__(self, config: PipelineConfig):
-        self.config = config
+def _extract_clip(
+    video_path: Path,
+    output_path: Path,
+    start: float,
+    duration: float,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration:.3f}",
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        logging.warning("ffmpeg clipping failed; falling back to OpenCV writer")
 
-    def write(self, features: Sequence[EliminationFeatures]) -> Tuple[Optional[Path], Optional[Path]]:
-        if not features:
-            logging.warning("No elimination features available to write reports.")
-            return None, None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        logging.error("Unable to open video for clip fallback: %s", video_path)
+        return
 
-        reports_dir = self.config.output_dir / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = reports_dir / "elimination_report.csv"
-        html_path = reports_dir / "elimination_report.html"
+    fps = _ensure_positive(cap.get(cv2.CAP_PROP_FPS), 30.0)
+    start_frame = max(int(start * fps), 0)
+    end_frame = start_frame + int(duration * fps)
 
-        rows = [dataclasses.asdict(feature) for feature in features]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    width = int(_ensure_positive(cap.get(cv2.CAP_PROP_FRAME_WIDTH), 640))
+    height = int(_ensure_positive(cap.get(cv2.CAP_PROP_FRAME_HEIGHT), 360))
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    frame_idx = start_frame
+    while frame_idx <= end_frame:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        writer.write(frame)
+        frame_idx += 1
+    writer.release()
+    cap.release()
+
+
+def _compute_frame_statistics(
+    video_path: Path,
+    metadata: VideoMetadata,
+    event: EliminationEvent,
+    config: PipelineConfig,
+) -> List[dict[str, float]]:
+    fps = metadata.fps
+    start_time = max(event.timestamp - config.pre_window, 0.0)
+    end_time = min(event.timestamp + config.post_window, metadata.duration or event.timestamp + config.post_window)
+
+    start_frame = max(int(start_time * fps), 0)
+    total_frames = int((end_time - start_time) * fps) + 1
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open video: {video_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    y0, y1, x0, x1 = _center_slice(metadata.height, metadata.width, config.center_ratio)
+
+    frame_stats: List[dict[str, float]] = []
+    prev_center_mean: Optional[float] = None
+    prev_center_patch: Optional[np.ndarray] = None
+
+    for idx in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if metadata.width == 0 or metadata.height == 0:
+            metadata.width = frame.shape[1]
+            metadata.height = frame.shape[0]
+            y0, y1, x0, x1 = _center_slice(metadata.height, metadata.width, config.center_ratio)
+
+        center_patch = gray[y0:y1, x0:x1]
+        if center_patch.size == 0:
+            y0, y1, x0, x1 = _center_slice(gray.shape[0], gray.shape[1], config.center_ratio)
+            center_patch = gray[y0:y1, x0:x1]
+
+        current_ts = start_time + idx / fps
+        center_mean = float(np.mean(center_patch))
+        center_std = float(np.std(center_patch))
+        derivative = 0.0 if prev_center_mean is None else center_mean - prev_center_mean
+        local_diff = 0.0
+        if prev_center_patch is not None and center_patch.size == prev_center_patch.size:
+            local_diff = float(np.mean(cv2.absdiff(center_patch, prev_center_patch)))
+
+        red_patch = frame[y0:y1, x0:x1, 2]
+        red_mean = float(np.mean(red_patch))
+        global_mean = float(np.mean(gray))
+
+        frame_stats.append(
+            {
+                "timestamp": current_ts,
+                "center_mean": center_mean,
+                "center_std": center_std,
+                "derivative": derivative,
+                "local_diff": local_diff,
+                "red_mean": red_mean,
+                "global_mean": global_mean,
+            }
+        )
+
+        prev_center_mean = center_mean
+        prev_center_patch = center_patch.copy()
+
+    cap.release()
+    return frame_stats
+
+
+def compute_features(
+    video_path: Path,
+    metadata: VideoMetadata,
+    event: EliminationEvent,
+    config: PipelineConfig,
+    clip_path: Optional[Path],
+) -> EliminationFeatures:
+    frame_stats = _compute_frame_statistics(video_path, metadata, event, config)
+
+    if clip_path is not None:
+        try:
+            clip_file = str(clip_path.relative_to(config.output_dir))
+        except ValueError:
+            clip_file = str(clip_path)
+    else:
+        clip_file = None
+
+    if not frame_stats:
+        return EliminationFeatures(
+            elim_id=event.elim_id,
+            timestamp=event.timestamp,
+            clip_file=clip_file,
+            reaction_ms=None,
+            dwell_ms=None,
+            micro_adjusts_per_s=None,
+            snap_magnitude_px=None,
+            snap_frames=None,
+            headshot=None,
+            shots_count=None,
+            headshot_ratio=None,
+            aim_variance=None,
+            muzzle_flash_count=None,
+            suspicion_score=0.0,
+            flags=["no_data"],
+        )
+
+    pre_frames = [fs for fs in frame_stats if fs["timestamp"] <= event.timestamp]
+    post_frames = [fs for fs in frame_stats if fs["timestamp"] >= event.timestamp]
+
+    baseline_source = [fs["center_mean"] for fs in pre_frames if fs["timestamp"] < event.timestamp - 0.2]
+    if not baseline_source:
+        baseline_source = [fs["center_mean"] for fs in frame_stats[: max(1, len(frame_stats) // 4)]]
+
+    baseline_mean = statistics.fmean(baseline_source)
+    baseline_std = statistics.pstdev(baseline_source) if len(baseline_source) > 1 else 1.0
+    reaction_threshold = baseline_mean + max(5.0, baseline_std * 1.5)
+
+    first_above = next((fs for fs in pre_frames if fs["center_mean"] >= reaction_threshold), None)
+    reaction_ms: Optional[float] = None
+    if first_above:
+        reaction_ms = max(0.0, (event.timestamp - first_above["timestamp"]) * 1000.0)
+
+    dwell_ms: Optional[float] = None
+    if first_above:
+        dwell_start = first_above["timestamp"]
+        for fs in reversed(pre_frames):
+            if fs["timestamp"] <= first_above["timestamp"]:
+                if fs["center_mean"] >= reaction_threshold:
+                    dwell_start = fs["timestamp"]
+                else:
+                    break
+        dwell_ms = max(0.0, (event.timestamp - dwell_start) * 1000.0)
+
+    adjust_threshold = max(2.0, baseline_std)
+    micro_adjusts = 0
+    prev_sign: Optional[int] = None
+    for fs in pre_frames:
+        derivative = fs["derivative"]
+        if abs(derivative) < adjust_threshold:
+            continue
+        sign = 1 if derivative > 0 else -1
+        if prev_sign is not None and sign != prev_sign:
+            micro_adjusts += 1
+        prev_sign = sign
+
+    pre_duration = max(config.pre_window, 0.5)
+    micro_adjusts_per_s = micro_adjusts / pre_duration
+
+    max_derivative = max(abs(fs["derivative"]) for fs in pre_frames) if pre_frames else 0.0
+    snap_magnitude_px = (max_derivative / 255.0) * (metadata.width or 1920)
+    snap_frames = sum(1 for fs in pre_frames if abs(fs["derivative"]) > adjust_threshold * 2)
+
+    muzzle_window_start = event.timestamp - 0.2
+    muzzle_window_end = event.timestamp + 0.05
+    muzzle_flash_count = sum(
+        1
+        for fs in frame_stats
+        if muzzle_window_start <= fs["timestamp"] <= muzzle_window_end
+        and fs["local_diff"] > adjust_threshold
+    )
+
+    post_window_end = event.timestamp + 0.4
+    post_slice = [fs for fs in post_frames if fs["timestamp"] <= post_window_end]
+    if not post_slice:
+        post_slice = post_frames[:1]
+
+    red_values = [fs["red_mean"] for fs in post_slice]
+    red_baseline = statistics.fmean([fs["red_mean"] for fs in pre_frames[-5:]]) if len(pre_frames) >= 5 else statistics.fmean(red_values)
+    headshot_threshold = red_baseline + 15.0
+    headshot_frames = [fs for fs in post_slice if fs["red_mean"] >= headshot_threshold]
+    headshot = bool(headshot_frames)
+    headshot_ratio = len(headshot_frames) / max(len(post_slice), 1)
+
+    shots_count = sum(
+        1
+        for fs in frame_stats
+        if event.timestamp - 0.3 <= fs["timestamp"] <= event.timestamp + 0.3
+        and fs["local_diff"] > adjust_threshold
+    )
+
+    aim_variance = statistics.pvariance([fs["center_mean"] for fs in pre_frames]) if len(pre_frames) > 1 else 0.0
+
+    suspicion_score = 0.0
+    flags: List[str] = []
+
+    if reaction_ms is not None and reaction_ms < config.min_reaction_ms:
+        suspicion_score += 0.4
+        flags.append("fast_reaction")
+    if dwell_ms is not None and dwell_ms < 120.0:
+        suspicion_score += 0.2
+        flags.append("short_dwell")
+    if snap_magnitude_px is not None and snap_magnitude_px > (metadata.width or 1920) * 0.15:
+        suspicion_score += 0.2
+        flags.append("snap_motion")
+    if micro_adjusts_per_s < 0.8:
+        suspicion_score += 0.1
+        flags.append("low_micro_adjusts")
+    if headshot:
+        suspicion_score += 0.1
+        flags.append("headshot")
+
+    suspicion_score = min(suspicion_score, 1.0)
+
+    return EliminationFeatures(
+        elim_id=event.elim_id,
+        timestamp=event.timestamp,
+        clip_file=clip_file,
+        reaction_ms=reaction_ms,
+        dwell_ms=dwell_ms,
+        micro_adjusts_per_s=micro_adjusts_per_s,
+        snap_magnitude_px=snap_magnitude_px,
+        snap_frames=snap_frames,
+        headshot=headshot,
+        shots_count=shots_count,
+        headshot_ratio=headshot_ratio,
+        aim_variance=aim_variance,
+        muzzle_flash_count=muzzle_flash_count,
+        suspicion_score=suspicion_score,
+        flags=flags,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def _features_to_dict(feature: EliminationFeatures) -> dict[str, object]:
+    data = dataclasses.asdict(feature)
+    data["flags"] = ",".join(feature.flags)
+    return data
+
+
+def write_csv(features: Sequence[EliminationFeatures], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [_features_to_dict(f) for f in features]
+    fieldnames = list(rows[0].keys()) if rows else [
+        "elim_id",
+        "timestamp",
+        "clip_file",
+        "reaction_ms",
+        "dwell_ms",
+        "micro_adjusts_per_s",
+        "snap_magnitude_px",
+        "snap_frames",
+        "headshot",
+        "shots_count",
+        "headshot_ratio",
+        "aim_variance",
+        "muzzle_flash_count",
+        "suspicion_score",
+        "flags",
+    ]
+    with output_path.open("w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
         for row in rows:
-            flags = row.get("flags") or []
-            row["flags"] = ",".join(flags)
-
-        if pd is not None:
-            frame = pd.DataFrame(rows)
-            frame.sort_values(by="suspicion_score", ascending=False, inplace=True)
-            frame.to_csv(csv_path, index=False)
-            html_content = self._build_html(frame)
-            html_path.write_text(html_content, encoding="utf-8")
-        else:
-            import csv
-
-            headers = sorted(rows[0].keys())
-            with csv_path.open("w", encoding="utf-8", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=headers)
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow(row)
-            html_path.write_text("<html><body><p>Pandas not installed; CSV only.</p></body></html>", encoding="utf-8")
-        logging.info("Reports written to %s and %s", csv_path, html_path)
-        return csv_path, html_path
-
-    def _build_html(self, frame: "pd.DataFrame") -> str:  # type: ignore[name-defined]
-        top = frame.head(20)
-        table_html = top.to_html(index=False, escape=True)
-        summary = f"<p>Generated at {datetime.utcnow().isoformat()}Z</p>"
-        html = f"""
-        <html>
-        <head>
-            <title>Aim Suspicion Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 2rem; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ccc; padding: 0.5rem; text-align: left; }}
-                th {{ background: #f0f0f0; }}
-            </style>
-        </head>
-        <body>
-            <h1>Aim Suspicion Report</h1>
-            {summary}
-            <h2>Top 20 Suspicious Eliminations</h2>
-            {table_html}
-        </body>
-        </html>
-        """
-        return html
+            writer.writerow(row)
 
 
-class AimDetectionPipeline:
-    """Main orchestration class for the aim detection pipeline."""
+def write_html(features: Sequence[EliminationFeatures], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for f in features:
+        clip_link = (
+            f'<a href="{f.clip_file}">{f.clip_file}</a>' if f.clip_file else ""
+        )
+        flags = ", ".join(f.flags) if f.flags else ""
+        rows.append(
+            "<tr>"
+            f"<td>{f.elim_id}</td>"
+            f"<td>{f.timestamp:.2f}</td>"
+            f"<td>{clip_link}</td>"
+            f"<td>{'' if f.reaction_ms is None else f'{f.reaction_ms:.1f}'}</td>"
+            f"<td>{'' if f.dwell_ms is None else f'{f.dwell_ms:.1f}'}</td>"
+            f"<td>{f.micro_adjusts_per_s:.2f if f.micro_adjusts_per_s is not None else ''}</td>"
+            f"<td>{f.snap_magnitude_px:.1f if f.snap_magnitude_px is not None else ''}</td>"
+            f"<td>{f.snap_frames if f.snap_frames is not None else ''}</td>"
+            f"<td>{'yes' if f.headshot else 'no' if f.headshot is not None else ''}</td>"
+            f"<td>{f.shots_count if f.shots_count is not None else ''}</td>"
+            f"<td>{f.headshot_ratio:.2f if f.headshot_ratio is not None else ''}</td>"
+            f"<td>{f.aim_variance:.2f if f.aim_variance is not None else ''}</td>"
+            f"<td>{f.muzzle_flash_count if f.muzzle_flash_count is not None else ''}</td>"
+            f"<td>{f.suspicion_score:.2f}</td>"
+            f"<td>{flags}</td>"
+            "</tr>"
+        )
 
-    def __init__(self, config: PipelineConfig):
-        self.config = config
-        self.metadata: Optional[VideoMetadata] = None
-        self.detectors: List[BaseDetector] = [
-            PreprocessedDetector(),
-            HeuristicKillFeedDetector(),
-            HeuristicAudioDetector(),
-        ]
-        self.fusion = DetectionFusion()
-        self.scorer = SuspicionScorer(config)
+    header = """
+    <tr>
+        <th>Elimination</th>
+        <th>Timestamp (s)</th>
+        <th>Clip</th>
+        <th>Reaction (ms)</th>
+        <th>Dwell (ms)</th>
+        <th>Micro adjusts / s</th>
+        <th>Snap magnitude (px)</th>
+        <th>Snap frames</th>
+        <th>Headshot</th>
+        <th>Shots</th>
+        <th>Headshot ratio</th>
+        <th>Aim variance</th>
+        <th>Muzzle flashes</th>
+        <th>Suspicion</th>
+        <th>Flags</th>
+    </tr>
+    """
 
-    def run(self) -> None:
-        logging.info("Starting aim detection pipeline for %s", self.config.video_path)
-        self.metadata = FFprobe.probe(self.config.video_path)
-        all_signals = self._run_detectors()
-        events = self.fusion.fuse(all_signals)
-        logging.info("Detected %d elimination events", len(events))
+    html = (
+        "<html><head><meta charset='utf-8'><title>Elimination report</title>"
+        "<style>body{font-family:Arial,Helvetica,sans-serif;background:#111;color:#eee;}"
+        "table{border-collapse:collapse;width:100%;}th,td{border:1px solid #444;padding:6px;}"
+        "th{background:#222;}tr:nth-child(even){background:#181818;}a{color:#6cf;}</style>"
+        "</head><body>"
+        "<h1>Elimination review report</h1>"
+        "<p>Generated by build_aim_detection_pipeline.py</p>"
+        "<table>" + header + "".join(rows) + "</table>"
+        "</body></html>"
+    )
 
-        clip_extractor = ClipExtractor(self.config, self.metadata)
-        feature_extractor = AimFeatureExtractor(self.config, self.metadata)
-        clips_dir = self.config.output_dir / "clips"
-        clips_dir.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html)
 
-        features: List[EliminationFeatures] = []
-        for idx, event in enumerate(events, start=1):
-            elim_id = f"{idx:04d}"
-            event.elim_id = elim_id
-            clip_path = clip_extractor.extract_clip(event, clips_dir)
-            extracted = feature_extractor.extract(event)
-            if clip_path:
-                extracted.clip_file = str(Path("clips") / clip_path.name)
-            features.append(extracted)
 
-        scored_features = self.scorer.score(features)
-        scored_features.sort(key=lambda f: f.suspicion_score or 0.0, reverse=True)
-        ReportWriter(self.config).write(scored_features)
-        logging.info("Pipeline completed. Processed %d eliminations.", len(scored_features))
+# ---------------------------------------------------------------------------
+# Pipeline driver
+# ---------------------------------------------------------------------------
 
-    def _run_detectors(self) -> List[DetectionSignal]:
-        signals: List[DetectionSignal] = []
-        for detector in self.detectors:
-            try:
-                detector_signals = detector.detect(self.config, self.metadata or VideoMetadata(60, 1920, 1080, 0))
-                logging.info("%s detector produced %d signals", detector.name, len(detector_signals))
-                signals.extend(detector_signals)
-            except Exception as exc:  # pragma: no cover - detectors may fail unexpectedly
-                logging.warning("Detector %s failed: %s", detector.name, exc)
-                if self.config.debug:
-                    raise
-        return signals
+def run_pipeline(config: PipelineConfig) -> List[EliminationFeatures]:
+    logging.info("Loading video metadata for %s", config.video_path)
+    metadata = load_video_metadata(config.video_path)
+
+    logging.info("Collecting frame scores")
+    scores, metadata = collect_frame_scores(config.video_path, metadata, config)
+
+    logging.info("Detecting elimination events")
+    events = detect_eliminations(scores, config)
+
+    features: List[EliminationFeatures] = []
+
+    if not events:
+        logging.warning("No elimination events detected; reports will be empty")
+
+    for event in events:
+        logging.info("Processing elimination %s at %.2fs", event.elim_id, event.timestamp)
+        clip_start = max(event.timestamp - config.pre_window, 0.0)
+        clip_duration = config.pre_window + config.post_window
+        clip_dir = config.output_dir / "clips"
+        clip_path = clip_dir / f"{event.elim_id}.mp4"
+        _extract_clip(config.video_path, clip_path, clip_start, clip_duration)
+
+        feature = compute_features(
+            config.video_path,
+            metadata,
+            event,
+            config,
+            clip_path,
+        )
+        features.append(feature)
+
+    features.sort(key=lambda f: f.suspicion_score, reverse=True)
+    return features
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
-    parser = argparse.ArgumentParser(description="Detect suspicious aim around eliminations in gameplay videos.")
-    parser.add_argument("--video", dest="video", required=True, help="Path to the gameplay video (mp4)")
-    parser.add_argument("--out", dest="out", required=True, help="Output directory for clips and reports")
-    parser.add_argument("--gpu", dest="gpu", type=int, default=None, help="GPU device index for decoding")
+    parser = argparse.ArgumentParser(
+        description="Detect eliminations and compute aim heuristics from a gameplay video",
+    )
+    parser.add_argument("--video", dest="video", required=True, help="Path to the gameplay video")
+    parser.add_argument("--out", dest="output", required=True, help="Directory for pipeline outputs")
     parser.add_argument("--pre", dest="pre", type=float, default=10.0, help="Seconds to include before elimination")
     parser.add_argument("--post", dest="post", type=float, default=2.0, help="Seconds to include after elimination")
-    parser.add_argument(
-        "--min_reaction_ms",
-        dest="min_reaction_ms",
-        type=float,
-        default=40.0,
-        help="Reaction time threshold considered suspicious",
-    )
-    parser.add_argument(
-        "--suspicion_thresh",
-        dest="suspicion_thresh",
-        type=float,
-        default=0.8,
-        help="Threshold above which eliminations are flagged",
-    )
-    parser.add_argument(
-        "--frame-sample",
-        dest="frame_sample",
-        type=int,
-        default=1,
-        help="Sample every Nth frame during analysis",
-    )
-    parser.add_argument(
-        "--chunk-duration",
-        dest="chunk_duration",
-        type=float,
-        default=None,
-        help="Optional chunk duration (seconds) for long videos",
-    )
-    parser.add_argument(
-        "--preprocessed-dir",
-        dest="preprocessed_dir",
-        type=str,
-        default=None,
-        help="Directory containing preprocessed detections/features",
-    )
-    parser.add_argument(
-        "--debug",
-        dest="debug",
-        action="store_true",
-        help="Raise exceptions instead of swallowing them",
-    )
+    parser.add_argument("--stride", dest="stride", type=int, default=1, help="Frame stride for detection pass")
+    parser.add_argument("--min-gap", dest="min_gap", type=float, default=1.5, help="Minimum seconds between eliminations")
+    parser.add_argument("--std-factor", dest="std_factor", type=float, default=2.5, help="Std deviation multiplier for detection threshold")
+    parser.add_argument("--min-reaction", dest="min_reaction", type=float, default=40.0, help="Suspicious reaction time threshold in ms")
+    parser.add_argument("--center-ratio", dest="center_ratio", type=float, default=0.18, help="Fraction of frame treated as center patch")
+    parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging")
 
     args = parser.parse_args(argv)
+
     config = PipelineConfig(
-        video_path=Path(args.video),
-        output_dir=Path(args.out),
-        gpu_device=args.gpu,
-        pre_window=args.pre,
-        post_window=args.post,
-        frame_sample_rate=max(1, args.frame_sample),
-        suspicion_threshold=args.suspicion_thresh,
-        min_reaction_ms=args.min_reaction_ms,
-        chunk_duration=args.chunk_duration,
-        preprocessed_dir=Path(args.preprocessed_dir) if args.preprocessed_dir else None,
+        video_path=Path(args.video).expanduser().resolve(),
+        output_dir=Path(args.output).expanduser().resolve(),
+        pre_window=max(0.1, args.pre),
+        post_window=max(0.1, args.post),
+        frame_stride=max(1, args.stride),
+        min_event_gap=max(0.2, args.min_gap),
+        detection_std_factor=max(0.5, args.std_factor),
+        min_reaction_ms=max(1.0, args.min_reaction),
+        center_ratio=max(0.02, min(args.center_ratio, 0.8)),
         debug=args.debug,
     )
     return config
 
 
-def configure_logging(debug: bool) -> None:
+def setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    logging.basicConfig(level=level, format="[%(levelname)s] %(message)s")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     config = parse_args(argv)
-    configure_logging(config.debug)
+    setup_logging(config.debug)
+
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    pipeline = AimDetectionPipeline(config)
-    pipeline.run()
+
+    features = run_pipeline(config)
+    report_csv = config.output_dir / "reports" / "elimination_report.csv"
+    report_html = config.output_dir / "reports" / "elimination_report.html"
+
+    write_csv(features, report_csv)
+    write_html(features, report_html)
+
+    logging.info("Wrote %s", report_csv)
+    logging.info("Wrote %s", report_html)
 
 
 if __name__ == "__main__":
